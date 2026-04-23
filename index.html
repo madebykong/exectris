@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blocks</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0a;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    canvas { display: block; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const CELL = 32;
+const FRAME_COLS = 30;
+const FRAME_ROWS = 16;
+const BOARD_COLS = 12;
+const BOARD_ROWS = 14;
+const BX = Math.floor((FRAME_COLS - BOARD_COLS) / 2); // 9
+const BY = Math.floor((FRAME_ROWS - BOARD_ROWS) / 2); // 1
+
+const canvas = document.getElementById('c');
+canvas.width  = FRAME_COLS * CELL;
+canvas.height = FRAME_ROWS * CELL;
+const ctx = canvas.getContext('2d');
+
+// ─── Piece definitions ────────────────────────────────────────────────────────
+// Each piece has a color and an array of rotations (each rotation = 2D bit grid)
+const PIECES = [
+  // T-Shape (green)  3 wide × 2 tall base
+  { color: '#129223', rots: [
+    [[0,1,0],[1,1,1]],
+    [[1,0],[1,1],[1,0]],
+    [[1,1,1],[0,1,0]],
+    [[0,1],[1,1],[0,1]],
+  ]},
+  // Square (blue)  2×2
+  { color: '#319AEA', rots: [
+    [[1,1],[1,1]],
+  ]},
+  // Rectangle (purple)  1×4
+  { color: '#3E51AF', rots: [
+    [[1],[1],[1],[1]],
+    [[1,1,1,1]],
+  ]},
+  // S-Shape (orange)  2 wide × 3 tall
+  { color: '#FF7504', rots: [
+    [[1,0],[1,1],[0,1]],
+    [[0,1,1],[1,1,0]],
+  ]},
+  // Mirror-S (yellow)  2 wide × 3 tall
+  { color: '#FECB02', rots: [
+    [[0,1],[1,1],[1,0]],
+    [[1,1,0],[0,1,1]],
+  ]},
+];
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let board, cur, curX, curY, curRot, next, score, lines, level, gameOver, paused;
+let lastTick = 0;
+let particles = [];
+let lastFrameTs = 0;
+let clearing = null; // { rows:[...], startTs, duration }
+
+function tickMs() { return Math.max(80, 600 - (level - 1) * 50); }
+
+function emptyBoard() {
+  return Array.from({ length: BOARD_ROWS }, () => Array(BOARD_COLS).fill(null));
+}
+
+function randomPiece() {
+  const idx = Math.floor(Math.random() * PIECES.length);
+  return { idx, rot: 0 };
+}
+
+function pieceShape(p) { return PIECES[p.idx].rots[p.rot]; }
+function pieceColor(p) { return PIECES[p.idx].color; }
+
+function collides(shape, x, y) {
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (!shape[r][c]) continue;
+      const nx = x + c, ny = y + r;
+      if (nx < 0 || nx >= BOARD_COLS || ny >= BOARD_ROWS) return true;
+      if (ny >= 0 && board[ny][nx]) return true;
+    }
+  }
+  return false;
+}
+
+function tryRotate(dir = 1) {
+  const piece = PIECES[cur.idx];
+  const nextRot = (cur.rot + dir + piece.rots.length) % piece.rots.length;
+  const shape = piece.rots[nextRot];
+  const kicks = [0, -1, 1, -2, 2];
+  for (const dx of kicks) {
+    if (!collides(shape, curX + dx, curY)) {
+      cur.rot = nextRot;
+      curX += dx;
+      return;
+    }
+  }
+}
+
+function lockPiece() {
+  const shape = pieceShape(cur);
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (!shape[r][c]) continue;
+      if (curY + r < 0) { triggerGameOver(); return; }
+      board[curY + r][curX + c] = pieceColor(cur);
+    }
+  }
+  const fullRows = [];
+  for (let r = 0; r < BOARD_ROWS; r++) {
+    if (board[r].every(c => c !== null)) fullRows.push(r);
+  }
+  if (fullRows.length) {
+    clearing = { rows: fullRows, startTs: performance.now(), duration: 320 };
+    cur = null;
+  } else {
+    spawnPiece();
+  }
+}
+
+function finishClear() {
+  const rows = clearing.rows.slice().sort((a, b) => b - a);
+  for (const r of rows) {
+    board.splice(r, 1);
+    board.unshift(Array(BOARD_COLS).fill(null));
+  }
+  const cleared = rows.length;
+  const pts = [0, 100, 300, 600, 1000];
+  score += (pts[cleared] || 1000) * level;
+  lines += cleared;
+  level = Math.floor(lines / 10) + 1;
+  clearing = null;
+  spawnPiece();
+}
+
+function triggerGameOver() {
+  gameOver = true;
+  // Add currently falling piece to the board so it also tumbles.
+  if (cur) {
+    const shape = pieceShape(cur);
+    for (let r = 0; r < shape.length; r++) {
+      for (let c = 0; c < shape[r].length; c++) {
+        if (!shape[r][c]) continue;
+        const by = curY + r, bx = curX + c;
+        if (by >= 0 && by < BOARD_ROWS && bx >= 0 && bx < BOARD_COLS) {
+          board[by][bx] = pieceColor(cur);
+        }
+      }
+    }
+  }
+  spawnParticles();
+}
+
+function spawnParticles() {
+  particles = [];
+  for (let r = 0; r < BOARD_ROWS; r++) {
+    for (let c = 0; c < BOARD_COLS; c++) {
+      if (!board[r][c]) continue;
+      const [px, py] = boardPx(c, r);
+      // Higher blocks get more horizontal spread and upward kick.
+      const heightFactor = (BOARD_ROWS - r) / BOARD_ROWS;
+      particles.push({
+        x: px + CELL / 2,
+        y: py + CELL / 2,
+        vx: (Math.random() - 0.5) * 7 * heightFactor,
+        vy: -Math.random() * 3 - 1,
+        rot: 0,
+        vr: (Math.random() - 0.5) * 0.35,
+        color: board[r][c],
+        settled: false,
+      });
+      board[r][c] = null;
+    }
+  }
+}
+
+function updateParticles(dt) {
+  const gravity = 0.55;
+  const floorCenterY = (BY + BOARD_ROWS) * CELL - CELL / 2;
+  const leftCenterX = BX * CELL + CELL / 2;
+  const rightCenterX = (BX + BOARD_COLS) * CELL - CELL / 2;
+  for (const p of particles) {
+    if (p.settled) continue;
+    p.vy += gravity;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.rot += p.vr;
+    if (p.y >= floorCenterY) {
+      p.y = floorCenterY;
+      if (Math.abs(p.vy) < 1.2 && Math.abs(p.vx) < 0.3) {
+        p.vy = 0; p.vx = 0; p.vr = 0;
+        // Snap rotation to nearest right angle as it settles.
+        p.rot = Math.round(p.rot / (Math.PI / 2)) * (Math.PI / 2);
+        p.settled = true;
+      } else {
+        p.vy *= -0.42;
+        p.vx *= 0.78;
+        p.vr *= 0.7;
+      }
+    }
+    if (p.x < leftCenterX) { p.x = leftCenterX; p.vx = Math.abs(p.vx) * 0.55; }
+    if (p.x > rightCenterX) { p.x = rightCenterX; p.vx = -Math.abs(p.vx) * 0.55; }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    if (p.rot) ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-CELL / 2, -CELL / 2, CELL, CELL);
+    ctx.restore();
+  }
+}
+
+
+function spawnPiece() {
+  cur = next;
+  next = randomPiece();
+  cur.rot = 0;
+  const shape = pieceShape(cur);
+  curX = Math.floor((BOARD_COLS - shape[0].length) / 2);
+  curY = -shape.length + 1; // start just above board
+  if (collides(shape, curX, curY)) {
+    triggerGameOver();
+  }
+}
+
+function init() {
+  board     = emptyBoard();
+  next      = randomPiece();
+  score     = 0;
+  lines     = 0;
+  level     = 1;
+  gameOver  = false;
+  paused    = false;
+  lastTick  = 0;
+  particles = [];
+  clearing  = null;
+  spawnPiece();
+}
+
+// ─── Input ────────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  keys[e.code] = true;
+
+  if (gameOver) {
+    if (e.code === 'KeyR') init();
+    return;
+  }
+  if (e.code === 'KeyP' || e.code === 'Escape') {
+    paused = !paused;
+    return;
+  }
+  if (paused) return;
+  if (clearing || !cur) return;
+
+  const shape = pieceShape(cur);
+  switch (e.code) {
+    case 'ArrowLeft':
+      if (!collides(shape, curX - 1, curY)) curX--;
+      break;
+    case 'ArrowRight':
+      if (!collides(shape, curX + 1, curY)) curX++;
+      break;
+    case 'ArrowDown':
+      if (!collides(shape, curX, curY + 1)) curY++;
+      else lockPiece();
+      lastTick = performance.now();
+      break;
+    case 'ArrowUp':
+    case 'KeyZ':
+      tryRotate(1);
+      break;
+    case 'KeyX':
+      tryRotate(-1);
+      break;
+    case 'Space':
+      while (!collides(pieceShape(cur), curX, curY + 1)) curY++;
+      lockPiece();
+      lastTick = performance.now();
+      break;
+  }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── Drawing ──────────────────────────────────────────────────────────────────
+function fillCell(px, py, color, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.fillRect(px, py, CELL, CELL);
+  ctx.globalAlpha = 1;
+}
+
+function boardPx(bx, by) {
+  return [(BX + bx) * CELL, (BY + by) * CELL];
+}
+
+function drawBackground() {
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = '#2F2F2F';
+  ctx.lineWidth = 0.5;
+  for (let c = 0; c <= FRAME_COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(c * CELL, 0); ctx.lineTo(c * CELL, canvas.height); ctx.stroke();
+  }
+  for (let r = 0; r <= FRAME_ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(0, r * CELL); ctx.lineTo(canvas.width, r * CELL); ctx.stroke();
+  }
+}
+
+function drawBoardBg() {
+  // Floor line delineating the bottom of the play area.
+  const y = (BY + BOARD_ROWS) * CELL + 0.5;
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(BX * CELL, y);
+  ctx.lineTo((BX + BOARD_COLS) * CELL, y);
+  ctx.stroke();
+}
+
+function drawBoard() {
+  const skip = clearing ? new Set(clearing.rows) : null;
+  for (let r = 0; r < BOARD_ROWS; r++) {
+    if (skip && skip.has(r)) continue;
+    for (let c = 0; c < BOARD_COLS; c++) {
+      if (board[r][c]) {
+        const [px, py] = boardPx(c, r);
+        fillCell(px, py, board[r][c]);
+      }
+    }
+  }
+}
+
+function drawClearing(ts) {
+  const prog = Math.min(1, (ts - clearing.startTs) / clearing.duration);
+  // Flash white rapidly for first 60%, then collapse inward.
+  const flashPhase = prog < 0.6;
+  const flashOn    = flashPhase && (Math.floor(prog * 18) % 2 === 0);
+  const collapse   = prog < 0.6 ? 0 : (prog - 0.6) / 0.4; // 0 → 1
+  for (const r of clearing.rows) {
+    for (let c = 0; c < BOARD_COLS; c++) {
+      const [px, py] = boardPx(c, r);
+      const color = board[r][c] || '#ffffff';
+      const inset = (collapse * CELL) / 2;
+      ctx.fillStyle = flashOn ? '#ffffff' : color;
+      ctx.globalAlpha = 1 - collapse * 0.15;
+      ctx.fillRect(px, py + inset, CELL, CELL - inset * 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawGhost() {
+  const shape = pieceShape(cur);
+  let ghostY = curY;
+  while (!collides(shape, curX, ghostY + 1)) ghostY++;
+  if (ghostY === curY) return;
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (!shape[r][c]) continue;
+      const by = ghostY + r;
+      if (by < 0) continue;
+      const [px, py] = boardPx(curX + c, by);
+      ctx.globalAlpha = 0.18;
+      ctx.fillStyle = pieceColor(cur);
+      ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawCurrent() {
+  const shape = pieceShape(cur);
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (!shape[r][c]) continue;
+      const by = curY + r;
+      if (by < 0) continue;
+      const [px, py] = boardPx(curX + c, by);
+      fillCell(px, py, pieceColor(cur));
+    }
+  }
+}
+
+function drawNextPanel() {
+  // Panel is to the right of the board
+  const panelX = (BX + BOARD_COLS + 1) * CELL;
+  const panelY = BY * CELL;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = 'bold 13px monospace';
+  ctx.fillText('NEXT', panelX, panelY + 18);
+
+  const shape = PIECES[next.idx].rots[0];
+  const color = PIECES[next.idx].color;
+  const offX = Math.floor((4 - shape[0].length) / 2);
+  const offY = Math.floor((4 - shape.length) / 2);
+
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (!shape[r][c]) continue;
+      const px = panelX + (offX + c) * CELL;
+      const py = panelY + 28 + (offY + r) * CELL;
+      fillCell(px, py, color);
+    }
+  }
+
+  // Stats
+  const statsY = panelY + 28 + 4 * CELL + 24;
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '11px monospace';
+  ctx.fillText('SCORE', panelX, statsY);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillText(score, panelX, statsY + 18);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '11px monospace';
+  ctx.fillText('LINES', panelX, statsY + 44);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillText(lines, panelX, statsY + 62);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '11px monospace';
+  ctx.fillText('LEVEL', panelX, statsY + 88);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillText(level, panelX, statsY + 106);
+}
+
+function drawControls() {
+  const cx = 16;
+  const cy = (BY + 2) * CELL;
+  const lines2 = [
+    '← → move',
+    '↑ / Z rotate',
+    'X  rev. rot',
+    '↓  soft drop',
+    '␣  hard drop',
+    'P  pause',
+    'R  restart',
+  ];
+  ctx.font = '10px monospace';
+  lines2.forEach((t, i) => {
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillText(t, cx, cy + i * 16);
+  });
+}
+
+function drawOverlay(title, sub) {
+  ctx.fillStyle = 'rgba(0,0,0,0.68)';
+  ctx.fillRect(BX * CELL, BY * CELL, BOARD_COLS * CELL, BOARD_ROWS * CELL);
+  ctx.textAlign = 'center';
+  const cx = (BX + BOARD_COLS / 2) * CELL;
+  const cy = (BY + BOARD_ROWS / 2) * CELL;
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 26px monospace';
+  ctx.fillText(title, cx, cy - 14);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '14px monospace';
+  ctx.fillText(sub, cx, cy + 14);
+  ctx.textAlign = 'left';
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────────────
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = lastFrameTs ? ts - lastFrameTs : 16;
+  lastFrameTs = ts;
+
+  if (clearing && ts - clearing.startTs >= clearing.duration) {
+    finishClear();
+  }
+
+  if (!gameOver && !paused && !clearing) {
+    if (ts - lastTick >= tickMs()) {
+      lastTick = ts;
+      const shape = pieceShape(cur);
+      if (!collides(shape, curX, curY + 1)) {
+        curY++;
+      } else {
+        lockPiece();
+      }
+    }
+  }
+
+  if (gameOver) updateParticles(dt);
+
+  drawBackground();
+  drawBoardBg();
+  drawBoard();
+  if (clearing) drawClearing(ts);
+  if (!gameOver && !paused && !clearing && cur) {
+    drawGhost();
+    drawCurrent();
+  }
+  if (gameOver) drawParticles();
+  drawNextPanel();
+  drawControls();
+
+  if (gameOver) drawGameOverText();
+  if (paused && !gameOver) drawOverlay('PAUSED', 'P to continue');
+}
+
+function drawGameOverText() {
+  const cx = (BX + BOARD_COLS / 2) * CELL;
+  const cy = (BY + 2) * CELL;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 26px monospace';
+  ctx.fillText('GAME OVER', cx, cy);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '14px monospace';
+  ctx.fillText(`Score ${score} — R to restart`, cx, cy + 22);
+  ctx.textAlign = 'left';
+}
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
