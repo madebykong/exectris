@@ -61,6 +61,20 @@ const PIECES = [
     [[0,1],[1,1],[1,0]],
     [[1,1,0],[0,1,1]],
   ]},
+  // L-Shape (terracotta)  2 wide × 3 tall
+  { color: '#D16743', rots: [
+    [[1,0],[1,0],[1,1]],
+    [[1,1,1],[1,0,0]],
+    [[1,1],[0,1],[0,1]],
+    [[0,0,1],[1,1,1]],
+  ]},
+  // Mirror-L / J (light blue)  2 wide × 3 tall
+  { color: '#A0C8E1', rots: [
+    [[0,1],[0,1],[1,1]],
+    [[1,0,0],[1,1,1]],
+    [[1,1],[1,0],[1,0]],
+    [[1,1,1],[0,0,1]],
+  ]},
 ];
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -133,10 +147,8 @@ function lockPiece() {
 
 function finishClear() {
   const rows = clearing.rows.slice().sort((a, b) => b - a);
-  for (const r of rows) {
-    board.splice(r, 1);
-    board.unshift(Array(BOARD_COLS).fill(null));
-  }
+  for (const r of rows) board.splice(r, 1);
+  while (board.length < BOARD_ROWS) board.unshift(Array(BOARD_COLS).fill(null));
   const cleared = rows.length;
   const pts = [0, 100, 300, 600, 1000];
   score += (pts[cleared] || 1000) * level;
